@@ -1,0 +1,13 @@
+# per-machine config — never commit
+config.json
+
+# python
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+tmp/
+.pytest_cache/
+*.egg-info/
+dist/
+build/
