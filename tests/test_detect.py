@@ -1,6 +1,7 @@
 import os
 
 import cv2
+import numpy as np
 import pytest
 
 from bootbreaker import detect
@@ -12,6 +13,12 @@ def _region(name):
     assert img is not None, name
     r = PLAY_REGION
     return img[r["top"]:r["top"] + r["height"], r["left"]:r["left"] + r["width"]]
+
+
+def _bgr(hsv):
+    return tuple(int(v) for v in cv2.cvtColor(
+        np.uint8([[hsv]]), cv2.COLOR_HSV2BGR
+    )[0, 0])
 
 
 # Every mid-play frame -> expected ball location (region-local): the centre of
@@ -33,6 +40,52 @@ NO_BALL_FRAMES = [
     "locked-place-before-throw.png",
     "playing-choosing-direction-to-throw.png",
 ]
+
+
+def test_detect_special_targets_orders_one_up_before_gold():
+    frame = np.zeros((400, 600, 3), dtype=np.uint8)
+    cv2.rectangle(frame, (80, 90), (145, 120), _bgr((65, 230, 230)), -1)
+    cv2.rectangle(frame, (280, 180), (390, 205), _bgr((18, 230, 230)), -1)
+
+    targets = detect.detect_special_targets(frame)
+
+    assert [target.kind for target in targets] == ["one_up", "gold"]
+    assert abs(targets[0].x - 112) <= 3
+    assert abs(targets[1].x - 335) <= 3
+
+
+def test_detect_indestructible_blue_bar_separately_from_loot_targets():
+    frame = np.zeros((400, 600, 3), dtype=np.uint8)
+    cv2.rectangle(frame, (180, 120), (250, 145), _bgr((95, 90, 185)), -1)
+
+    bars = detect.detect_indestructible_bars(frame)
+
+    assert len(bars) == 1
+    assert abs(bars[0].x - 215) <= 3
+    assert detect.detect_special_targets(frame) == []
+
+
+def test_breakable_mass_counts_warm_and_pale_blocks_not_blue_bars():
+    frame = np.zeros((400, 600, 3), dtype=np.uint8)
+    cv2.rectangle(frame, (80, 100), (140, 130), _bgr((20, 180, 230)), -1)
+    cv2.rectangle(frame, (180, 100), (240, 130), _bgr((95, 90, 185)), -1)
+
+    with_gold = detect.estimate_breakable_mass(frame)
+    frame[100:131, 80:141] = 0
+
+    assert with_gold > 1_000
+    assert detect.estimate_breakable_mass(frame) == 0
+
+
+def test_detect_paddle_surface_uses_narrow_cyan_rail():
+    frame = np.zeros((600, 800, 3), dtype=np.uint8)
+    cv2.rectangle(frame, (340, 500), (460, 508), _bgr((95, 220, 220)), -1)
+
+    surface = detect.detect_paddle_surface(frame, cart=(400, 530))
+
+    assert surface is not None
+    assert abs(surface.center - 400) <= 4
+    assert surface.right - surface.left >= 110
 
 
 @pytest.mark.parametrize("name,expected", list(BALL_FRAMES.items()))

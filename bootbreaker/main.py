@@ -54,15 +54,21 @@ def _ensure_region(recalibrate: bool) -> dict:
     return region
 
 
-def _launch(controller: Controller, region: dict, debug: bool = False) -> None:
-    # Lock the cart, then steer the aim to vertical with A/D (closed loop) before
-    # throwing, so the ball goes straight up and is easiest to catch.
+def _launch(
+    controller: Controller,
+    region: dict,
+    debug: bool = False,
+    target_angle: float = 0.0,
+) -> None:
+    # Lock the cart, then steer the aim to a controlled diagonal. The feedback
+    # loop still self-corrects A/D direction, so this works even though the
+    # game's rotation direction is not known in advance.
     controller.release_all()
     controller.tap_space()  # lock cart position
     time.sleep(0.3)  # let the aim phase begin
 
     key = "a"  # initial guess; the loop flips it if it makes the angle worse
-    prev_abs = None
+    prev_error = None
     samples: list[float] = []
     angle = None
     for _ in range(_AIM_MAX_ADJUST):
@@ -74,20 +80,24 @@ def _launch(controller: Controller, region: dict, debug: bool = False) -> None:
             time.sleep(_AIM_SAMPLE_DELAY)  # aim not visible yet; retry
             continue
         samples.append(round(angle, 1))
-        if abs(angle) <= _AIM_TOLERANCE:
-            break  # close enough to straight up
-        # If the last pulse didn't reduce the tilt, we're pushing the wrong way
-        # (or overshot) - flip the key.
-        if prev_abs is not None and abs(angle) >= prev_abs:
+        error = angle - target_angle
+        if abs(error) <= _AIM_TOLERANCE:
+            break  # close enough to the desired combo angle
+        # If the last pulse didn't reduce the angle error, we're pushing the
+        # wrong way (or overshot) - flip the key.
+        if prev_error is not None and abs(error) >= prev_error:
             key = "d" if key == "a" else "a"
-        prev_abs = abs(angle)
+        prev_error = abs(error)
         controller.hold(key)  # pulse A/D to rotate the aim
         time.sleep(_AIM_STEP_HOLD)
         controller.release_all()
         time.sleep(_AIM_SETTLE)
 
     controller.release_all()
-    print(f"[bootbreaker] throwing (aim angle: {angle}, samples: {samples[-12:]})")
+    print(
+        f"[bootbreaker] throwing (aim angle: {angle}, target: {target_angle}, "
+        f"samples: {samples[-12:]})"
+    )
     controller.tap_space()  # throw
     time.sleep(0.4)  # let the ball leave the cart before we track it
 
@@ -170,7 +180,7 @@ def _render_debug(frame, bot: Bot, action: str):
     # bot holds, so the band vs the target line shows exactly why it moves/holds.
     if bot.last_cart:
         cx, cy = bot.last_cart
-        dz = int(bot.deadzone)
+        dz = int(bot.last_deadzone)
         band = vis.copy()
         cv2.rectangle(band, (cx - dz, 0), (cx + dz, h), (0, 0, 255), -1)
         cv2.addWeighted(band, 0.15, vis, 0.85, 0, vis)
@@ -188,6 +198,30 @@ def _render_debug(frame, bot: Bot, action: str):
         cv2.circle(vis, (bx, by), 12, (255, 255, 0), 2)
         cv2.circle(vis, (bx, by), 3, (255, 255, 0), -1)
 
+    # Special targets: 1-UP is lime, gold bars are amber. The outlined one is
+    # the current mission; after the timeout none are outlined and the HUD says
+    # ADVANCE, so it is obvious why the bot has stopped chasing a bonus.
+    for special in bot.last_targets:
+        color = (0, 255, 80) if special.kind == "one_up" else (0, 190, 255)
+        cv2.circle(vis, (special.x, special.y), 13, color, 2)
+        cv2.putText(vis, special.kind, (special.x + 15, special.y - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
+    # Blue bars are indestructible: mark them as bounce geometry, never as
+    # score targets. Their actual box is shown so the debug view distinguishes
+    # them clearly from the selected gold circle.
+    for bar in bot.last_bounce_surfaces:
+        x1, y1 = bar.x - bar.width // 2, bar.y - bar.height // 2
+        x2, y2 = x1 + bar.width, y1 + bar.height
+        cv2.rectangle(vis, (x1, y1), (x2, y2), (255, 140, 0), 1)
+        cv2.putText(vis, "bounce", (x1, y1 - 4),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 140, 0), 1)
+    if bot.mission:
+        marker = (0, 255, 255) if bot.mission.kind == "gold" else (255, 255, 255)
+        label = "TARGET GOLD" if bot.mission.kind == "gold" else "TARGET 1-UP"
+        cv2.circle(vis, (bot.mission.x, bot.mission.y), 24, marker, 3)
+        cv2.putText(vis, label, (bot.mission.x + 28, bot.mission.y + 5),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, marker, 2)
+
     tgt = None if bot._target_x is None else int(bot._target_x)
     hud = [
         f"{bot.state}  action: {action}",
@@ -195,6 +229,12 @@ def _render_debug(frame, bot: Bot, action: str):
         f"ball:   {bot.last_ball}",
         f"cart:   {bot.last_cart}",
         f"target: {tgt}",
+        f"mission: {bot.mission_mode}",
+        f"attempts: {bot._mission_attempts}  returns: {bot.paddle_returns}",
+        f"rebound: {bot.last_rebound_mode}",
+        f"combo: {bot.combo_bounces}  last/best: {bot.last_combo}/{bot.best_combo}",
+        f"board: {bot.last_board_mass}  stale returns: {bot.returns_without_progress}",
+        f"blue bounce: {None if bot.last_blue_bounce is None else (bot.last_blue_bounce.x, bot.last_blue_bounce.y)}",
     ]
     cv2.rectangle(vis, (0, 0), (330, 24 + 30 * len(hud)), (0, 0, 0), -1)
     for i, txt in enumerate(hud):
@@ -242,9 +282,22 @@ def main(argv: list[str] | None = None) -> None:
             action = bot.step(frame)
 
             if action == "launch":
-                _launch(controller, region, debug=args.debug)
+                _launch(
+                    controller,
+                    region,
+                    debug=args.debug,
+                    target_angle=bot.launch_angle(),
+                )
                 bot.prime_playing()  # give the ball time to appear; don't churn
                 last_t = time.perf_counter()  # don't count launch in fps
+            elif action == "recalibrate":
+                # A new level can redraw the board while the game briefly has
+                # neither a boot nor the normal throw prompt. Refresh the
+                # capture bounds so the next prompt is seen instead of idling.
+                controller.release_all()
+                print("[bootbreaker] level transition detected; recalibrating region...")
+                region = _ensure_region(True)
+                last_t = time.perf_counter()
             elif action == "hold":
                 controller.release_all()
             else:  # "left" / "right"

@@ -1,6 +1,7 @@
 """Color-based detection of the play region, ball, and cart (OpenCV/HSV)."""
 
 import os
+from dataclasses import dataclass
 
 import cv2
 import numpy as np
@@ -86,6 +87,153 @@ _CART_PART_FRAC = 0.4  # keep red blocks >= this fraction of the largest (awning
 # keeping the glow. Upper bound stays wide to survive motion blur.
 _CYAN_LO = (80, 130, 170)
 _CYAN_HI = (110, 255, 255)
+
+
+@dataclass(frozen=True)
+class SpecialTarget:
+    """A collectible/bonus block that is worth steering the next bounce at."""
+
+    kind: str  # "one_up" or "gold"
+    x: int
+    y: int
+
+
+@dataclass(frozen=True)
+class BounceSurface:
+    """An indestructible blue bar that can extend a combo, but grants no loot."""
+
+    x: int
+    y: int
+    width: int
+    height: int
+
+
+@dataclass(frozen=True)
+class PaddleSurface:
+    """The narrow cyan rail that actually bounces the boot."""
+
+    left: int
+    right: int
+    y: int
+
+    @property
+    def center(self) -> int:
+        return (self.left + self.right) // 2
+
+    @property
+    def half_width(self) -> float:
+        return (self.right - self.left) / 2
+
+
+# These targets are deliberately detected separately from ordinary bricks.
+# Their highly saturated green/orange artwork is stable across layouts, whereas
+# normal stone blocks are pale and low-saturation.  The search is restricted to
+# the play field above the cart so side decorations cannot become missions.
+# Bonus blocks live in the brick field. The bottom third contains score bursts
+# and falling particles with the same orange hue, so exclude it entirely.
+_SPECIAL_BAND = (0.05, 0.68)
+_ONE_UP_LO = (40, 130, 130)
+_ONE_UP_HI = (90, 255, 255)
+_GOLD_LO = (5, 130, 110)
+_GOLD_HI = (35, 255, 255)
+_SPECIAL_KERNEL = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+# Steel-blue blocks are deliberately kept out of the gold mask. They have a
+# flatter/less-saturated cyan than the boot glow and are useful only as a known
+# rebound surface.
+_BLUE_BAR_LO = (80, 45, 115)
+_BLUE_BAR_HI = (115, 125, 245)
+
+
+def _special_centres(mask, kind: str, min_area: int) -> list[SpecialTarget]:
+    """Return rectangular, saturated target blobs from a colour mask."""
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, _SPECIAL_KERNEL)
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    targets = []
+    for contour in contours:
+        area = cv2.contourArea(contour)
+        if area < min_area:
+            continue
+        x, y, width, height = cv2.boundingRect(contour)
+        max_width = 650 if kind == "gold" else 360
+        max_height = 350 if kind == "gold" else 110
+        if height < 12 or height > max_height or width < 8 or width > max_width:
+            continue
+        aspect = width / height
+        if not 0.45 <= aspect <= 14:
+            continue
+        min_fill = 0.20 if kind == "gold" else 0.25
+        if area / (width * height) < min_fill:
+            continue
+        targets.append(SpecialTarget(kind, x + width // 2, y + height // 2))
+    return targets
+
+
+def detect_special_targets(image) -> list[SpecialTarget]:
+    """Find high-value targets, ordered as 1-UP first and gold second.
+
+    Gold bars can be grouped into a larger orange cluster; aiming at that
+    cluster is preferable to chasing a specific tiny shard.  The caller keeps
+    the chosen mission stable over time, so harmless contour jitter does not
+    repeatedly retarget the cart.
+    """
+    h = image.shape[0]
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    band = np.zeros(hsv.shape[:2], dtype=np.uint8)
+    band[int(_SPECIAL_BAND[0] * h):int(_SPECIAL_BAND[1] * h), :] = 255
+    one_up = cv2.bitwise_and(cv2.inRange(hsv, _ONE_UP_LO, _ONE_UP_HI), band)
+    gold = cv2.bitwise_and(cv2.inRange(hsv, _GOLD_LO, _GOLD_HI), band)
+    return (
+        _special_centres(one_up, "one_up", min_area=70)
+        + _special_centres(gold, "gold", min_area=55)
+    )
+
+
+def detect_indestructible_bars(image) -> list[BounceSurface]:
+    """Locate blue indestructible bars without confusing them for the boot.
+
+    We only retain block-sized rectangles in the upper play field. They are
+    handed to the combo controller as optional rebound geometry, never to the
+    collectible-target selector.
+    """
+    h = image.shape[0]
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    mask = cv2.inRange(hsv, _BLUE_BAR_LO, _BLUE_BAR_HI)
+    band = np.zeros(mask.shape, dtype=np.uint8)
+    band[int(_SPECIAL_BAND[0] * h):int(_SPECIAL_BAND[1] * h), :] = 255
+    mask = cv2.bitwise_and(mask, band)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, _SPECIAL_KERNEL)
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    bars = []
+    for contour in contours:
+        area = cv2.contourArea(contour)
+        if area < 180:
+            continue
+        x, y, width, height = cv2.boundingRect(contour)
+        if not (20 <= width <= 150 and 12 <= height <= 60):
+            continue
+        if not 0.8 <= width / height <= 6:
+            continue
+        if area / (width * height) < 0.35:
+            continue
+        bars.append(BounceSurface(x + width // 2, y + height // 2, width, height))
+    return bars
+
+
+def estimate_breakable_mass(image) -> int:
+    """Return a stable proxy for the visible destructible-board area.
+
+    This is intentionally not OCR: level layouts and score-panel placement vary,
+    while ordinary stone/gold blocks consistently occupy warm or pale pixels in
+    the upper board. Blue bars are outside the warm hue range, so they do not
+    create fake progress when used as rebound surfaces.
+    """
+    h = image.shape[0]
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    # Pale stone blocks and warm gold blocks; background is much darker.
+    mask = cv2.inRange(hsv, (0, 0, 135), (45, 255, 255))
+    band = np.zeros(mask.shape, dtype=np.uint8)
+    band[int(0.05 * h):int(0.75 * h), :] = 255
+    return int(cv2.countNonZero(cv2.bitwise_and(mask, band)))
 
 
 def detect_ball(image, cart: tuple[int, int] | None = None) -> tuple[int, int] | None:
@@ -214,6 +362,49 @@ def detect_cart(image, strip_frac: float = 0.25) -> tuple[int, int] | None:
     cx = (min(x for x, _, _, _ in boxes) + max(x + bw for x, _, bw, _ in boxes)) // 2
     cy = int(sum(y + bh / 2 for _, y, _, bh in boxes) / len(boxes)) + y0
     return (cx, cy)
+
+
+def detect_paddle_surface(
+    image, cart: tuple[int, int] | None = None
+) -> PaddleSurface | None:
+    """Find the cart's cyan collision rail, not its wider decorative body."""
+    if cart is None:
+        cart = detect_cart(image)
+    if cart is None:
+        return None
+    h, w = image.shape[:2]
+    cx, cy = cart
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    # Slightly broader than the boot glow range, but constrained tightly around
+    # the cart in the lower board so the flying boot cannot win this match.
+    mask = cv2.inRange(hsv, (80, 80, 130), (115, 255, 255))
+    band = np.zeros(mask.shape, dtype=np.uint8)
+    y1 = max(0, int(cy - 0.12 * h))
+    y2 = min(h, int(cy + 0.04 * h))
+    x1 = max(0, int(cx - 0.18 * w))
+    x2 = min(w, int(cx + 0.18 * w))
+    band[y1:y2, x1:x2] = 255
+    mask = cv2.bitwise_and(mask, band)
+    # The rail is often drawn as several short cyan highlights separated by
+    # dark pixel gaps. Join that *thin horizontal* line, without merging it
+    # vertically into the non-bouncy cart body below it.
+    mask = cv2.morphologyEx(
+        mask, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_RECT, (21, 3))
+    )
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    candidates = []
+    for contour in contours:
+        x, y, width, height = cv2.boundingRect(contour)
+        if not (45 <= width <= 220 and 2 <= height <= 28):
+            continue
+        midpoint = x + width / 2
+        if abs(midpoint - cx) > 0.13 * w:
+            continue
+        candidates.append((width, -abs(midpoint - cx), x, y, height))
+    if not candidates:
+        return None
+    width, _, x, y, height = max(candidates)
+    return PaddleSurface(x, x + width, y + height // 2)
 
 
 # The pre-throw states ("LOCK CART POSITION" and "THROW BOOT") both show the same
